@@ -95,7 +95,16 @@ def parse_ics(text: str):
 
 
 def load_calendar_events(url: str):
-    resp = requests.get(url, timeout=30)
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"),
+        "Accept": "text/calendar,text/plain,*/*;q=0.8",
+        "Accept-Language": "ar,en;q=0.8",
+    }
+    resp = requests.get(url, headers=headers, timeout=30)
+    if resp.status_code in (401, 403):
+        sys.exit(f"Calendar server refused the request (HTTP {resp.status_code}). "
+                 "It may block GitHub servers, or the link is wrong/expired.")
     resp.raise_for_status()
     resp.encoding = "utf-8"
     return parse_ics(resp.text)
