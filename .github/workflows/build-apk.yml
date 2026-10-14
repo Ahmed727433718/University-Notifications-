@@ -1,0 +1,59 @@
+name: Build Android app
+
+on:
+  push:
+    paths:
+      - app_files.txt
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project files
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          text = open("app_files.txt", encoding="utf-8").read()
+          parts = re.split(r"^=== FILE: (.+?) ===\n", text, flags=re.M)
+          for i in range(1, len(parts), 2):
+              p = pathlib.Path("android") / parts[i].strip()
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(parts[i + 1], encoding="utf-8")
+              print("wrote", p)
+          PY
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Accept Android licenses and install platform
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+
+      - name: Build debug APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk StudyBrief.apk
+          gh release create "apk-${{ github.run_number }}" StudyBrief.apk \
+            --title "StudyBrief build ${{ github.run_number }}" \
+            --notes "Debug APK. Install on Android and allow installs from this source." \
+            --latest
