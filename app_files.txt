@@ -1,0 +1,1065 @@
+=== FILE: app/build.gradle ===
+plugins {
+    id 'com.android.application'
+}
+
+// Fixed signing key (stored as text in studybrief.jks.b64) so every new build can be installed over the old one.
+def keystoreText = file('studybrief.jks.b64')
+def keystoreFile = new File(layout.buildDirectory.get().asFile, 'studybrief.jks')
+if (keystoreText.exists()) {
+    keystoreFile.parentFile.mkdirs()
+    keystoreFile.bytes = Base64.decoder.decode(keystoreText.text.replaceAll('\\s', ''))
+}
+
+android {
+    namespace 'app.studybrief'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'app.studybrief'
+        minSdk 26
+        targetSdk 34
+        // Grows with every GitHub build, so updates are always accepted as newer.
+        versionCode Integer.parseInt(System.getenv('GITHUB_RUN_NUMBER') ?: '1')
+        versionName '1.0'
+    }
+
+    signingConfigs {
+        debug {
+            if (keystoreFile.exists()) {
+                storeFile keystoreFile
+                storePassword 'studybrief'
+                keyAlias 'studybrief'
+                keyPassword 'studybrief'
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+=== FILE: app/src/main/AndroidManifest.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".AlarmReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
+=== FILE: app/src/main/java/app/studybrief/AlarmReceiver.java ===
+package app.studybrief;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+
+public class AlarmReceiver extends BroadcastReceiver {
+    @Override
+    public void onReceive(Context context, Intent intent) {
+        final Context app = context.getApplicationContext();
+        final PendingResult result = goAsync();
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    Scheduler.scheduleNext(app);
+                    Refresher.refreshAndNotify(app);
+                } finally {
+                    result.finish();
+                }
+            }
+        }).start();
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/BootReceiver.java ===
+package app.studybrief;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+
+/** Re-arms the daily alarm after a reboot or an app update. */
+public class BootReceiver extends BroadcastReceiver {
+    @Override
+    public void onReceive(Context context, Intent intent) {
+        if (!Store.url(context).isEmpty()) Scheduler.scheduleNext(context);
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Brief.java ===
+package app.studybrief;
+
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+
+/** Pure logic: which events matter and how to describe them. */
+final class Brief {
+    private Brief() {}
+
+    private static final String[] QUIZ = {"quiz", "exam", "midterm", "كويز", "اختبار", "امتحان", "امتحـان"};
+    private static final String[] DUE = {"due", "deadline", "closes", "assign", "تسليم", "واجب", "مهمة", "مهمه", "يغلق", "إغلاق", "اغلاق", "موعد"};
+    private static final String[] OPENS = {"opens", "يفتح", "فتح "};
+
+    private static boolean has(String title, String[] words) {
+        String t = title.toLowerCase(Locale.ROOT);
+        for (String w : words) if (t.contains(w)) return true;
+        return false;
+    }
+
+    static boolean isQuiz(String t) { return has(t, QUIZ); }
+    static boolean isDue(String t) { return has(t, DUE); }
+    static boolean isOpening(String t) { return has(t, OPENS); }
+
+    static String icon(String t) {
+        if (isQuiz(t)) return "📝";
+        if (isDue(t)) return "📌";
+        return "📅";
+    }
+
+    static LocalDate dateOf(Event e, ZoneId zone) {
+        return Instant.ofEpochMilli(e.start).atZone(zone).toLocalDate();
+    }
+
+    static String time(Event e, ZoneId zone) {
+        if (e.allDay) return "طوال اليوم";
+        return String.format(Locale.ROOT, "%02d:%02d",
+                Instant.ofEpochMilli(e.start).atZone(zone).getHour(),
+                Instant.ofEpochMilli(e.start).atZone(zone).getMinute());
+    }
+
+    static List<Event> sorted(List<Event> evs) {
+        List<Event> c = new ArrayList<>(evs);
+        Collections.sort(c, new Comparator<Event>() {
+            @Override public int compare(Event a, Event b) { return Long.compare(a.start, b.start); }
+        });
+        return c;
+    }
+
+    static List<Event> onDay(List<Event> evs, LocalDate day, ZoneId zone) {
+        List<Event> out = new ArrayList<>();
+        for (Event e : sorted(evs)) if (dateOf(e, zone).equals(day)) out.add(e);
+        return out;
+    }
+
+    /** Quizzes/exams within 2 days, deadlines today or tomorrow. "Opens" events are not urgent. */
+    static List<Event> important(List<Event> evs, LocalDate today, ZoneId zone) {
+        List<Event> out = new ArrayList<>();
+        for (Event e : sorted(evs)) {
+            if (isOpening(e.title)) continue;
+            long days = ChronoUnit.DAYS.between(today, dateOf(e, zone));
+            if (days < 0) continue;
+            if (isQuiz(e.title) && days <= 2) out.add(e);
+            else if (isDue(e.title) && days <= 1) out.add(e);
+        }
+        return out;
+    }
+
+    static String dayLabel(LocalDate d, LocalDate today) {
+        long n = ChronoUnit.DAYS.between(today, d);
+        if (n == 0) return "اليوم";
+        if (n == 1) return "بكرة";
+        return "بعد " + n + " أيام";
+    }
+
+    /** Course in brackets, unless the title already says it. */
+    private static String courseSuffix(Event e) {
+        if (e.course.isEmpty() || e.title.contains(e.course)) return "";
+        return " (" + e.course + ")";
+    }
+
+    static String line(Event e, ZoneId zone) {
+        return icon(e.title) + " " + time(e, zone) + " — " + e.title + courseSuffix(e);
+    }
+
+    static String describe(Event e, LocalDate today, ZoneId zone) {
+        String extra = courseSuffix(e);
+        return icon(e.title) + " " + dayLabel(dateOf(e, zone), today) + " " + time(e, zone) + " — " + e.title + extra;
+    }
+
+    /** Text for the morning notification. */
+    static String notificationBody(List<Event> evs, LocalDate today, ZoneId zone) {
+        List<Event> imp = important(evs, today, zone);
+        List<Event> todayList = onDay(evs, today, zone);
+        StringBuilder sb = new StringBuilder();
+        if (!imp.isEmpty()) {
+            sb.append("⚠️ مهم\n");
+            for (Event e : imp) sb.append(describe(e, today, zone)).append('\n');
+            sb.append('\n');
+        }
+        if (todayList.isEmpty()) {
+            sb.append("ما في شي اليوم 🎉");
+        } else {
+            sb.append("اليوم\n");
+            for (Event e : todayList) sb.append(line(e, zone)).append('\n');
+        }
+        return sb.toString().trim();
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Event.java ===
+package app.studybrief;
+
+final class Event {
+    final long start;      // epoch millis
+    final boolean allDay;
+    final String title;
+    final String course;
+
+    Event(long start, boolean allDay, String title, String course) {
+        this.start = start;
+        this.allDay = allDay;
+        this.title = title == null ? "" : title;
+        this.course = course == null ? "" : course;
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Ics.java ===
+package app.studybrief;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/** Minimal iCalendar reader for Moodle exports (VEVENT with DTSTART / SUMMARY / CATEGORIES). */
+final class Ics {
+    private Ics() {}
+
+    private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss");
+
+    static List<Event> parse(String text, ZoneId local) {
+        String[] raw = text.replace("\r\n", "\n").replace("\r", "\n").split("\n");
+        List<String> lines = new ArrayList<>();
+        for (String r : raw) {
+            if (!r.isEmpty() && (r.charAt(0) == ' ' || r.charAt(0) == '\t') && !lines.isEmpty()) {
+                int last = lines.size() - 1;
+                lines.set(last, lines.get(last) + r.substring(1)); // unfold continuation line
+            } else {
+                lines.add(r);
+            }
+        }
+
+        List<Event> out = new ArrayList<>();
+        boolean inEvent = false;
+        boolean hasStart = false;
+        boolean allDay = false;
+        long start = 0;
+        String title = "";
+        String course = "";
+
+        for (String ln : lines) {
+            if (ln.equals("BEGIN:VEVENT")) {
+                inEvent = true;
+                hasStart = false;
+                allDay = false;
+                title = "";
+                course = "";
+                continue;
+            }
+            if (ln.equals("END:VEVENT")) {
+                if (inEvent && hasStart) out.add(new Event(start, allDay, title, course));
+                inEvent = false;
+                continue;
+            }
+            if (!inEvent) continue;
+
+            int colon = ln.indexOf(':');
+            if (colon < 0) continue;
+            String head = ln.substring(0, colon);
+            String value = ln.substring(colon + 1);
+            String[] parts = head.split(";");
+            String name = parts[0].toUpperCase();
+            Map<String, String> params = new HashMap<>();
+            for (int i = 1; i < parts.length; i++) {
+                int eq = parts[i].indexOf('=');
+                if (eq > 0) params.put(parts[i].substring(0, eq).toUpperCase(), parts[i].substring(eq + 1));
+            }
+
+            if (name.equals("DTSTART")) {
+                try {
+                    long[] r = parseDt(params, value, local);
+                    start = r[0];
+                    allDay = r[1] == 1;
+                    hasStart = true;
+                } catch (RuntimeException ignored) {
+                    // skip events with a date we cannot read
+                }
+            } else if (name.equals("SUMMARY")) {
+                title = unescape(value);
+            } else if (name.equals("CATEGORIES")) {
+                course = unescape(value);
+            }
+        }
+        return out;
+    }
+
+    private static long[] parseDt(Map<String, String> params, String raw, ZoneId local) {
+        String v = raw.trim();
+        if ("DATE".equals(params.get("VALUE")) || v.length() == 8) {
+            LocalDate d = LocalDate.parse(v.substring(0, 8), DateTimeFormatter.BASIC_ISO_DATE);
+            return new long[]{d.atStartOfDay(local).toInstant().toEpochMilli(), 1};
+        }
+        if (v.endsWith("Z")) {
+            LocalDateTime ldt = LocalDateTime.parse(v.substring(0, v.length() - 1), DT);
+            return new long[]{ldt.toInstant(ZoneOffset.UTC).toEpochMilli(), 0};
+        }
+        ZoneId zone = local;
+        String tzid = params.get("TZID");
+        if (tzid != null) {
+            try {
+                zone = ZoneId.of(tzid.replace("\"", ""));
+            } catch (RuntimeException e) {
+                zone = local;
+            }
+        }
+        LocalDateTime ldt = LocalDateTime.parse(v, DT);
+        return new long[]{ldt.atZone(zone).toInstant().toEpochMilli(), 0};
+    }
+
+    private static String unescape(String s) {
+        return s.replace("\\n", " ").replace("\\N", " ").replace("\\,", ",")
+                .replace("\\;", ";").replace("\\\\", "\\").trim();
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/MainActivity.java ===
+package app.studybrief;
+
+import android.Manifest;
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.res.Configuration;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
+import android.text.InputType;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Locale;
+
+public class MainActivity extends Activity {
+    private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+    private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
+
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private int bg, card, text, muted, accent;
+
+    private TextView importantLabel, importantBody, listView, status;
+    private View importantCard;
+    private int mode = 0; // 0 = upcoming, 1 = last 7 days, 2 = last 30 days
+    private static final String[] FILTER_LABELS = {"القادم", "الأسبوع الماضي", "الشهر الماضي"};
+    private final Button[] filterBtns = new Button[FILTER_LABELS.length];
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        boolean dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                == Configuration.UI_MODE_NIGHT_YES;
+        bg = dark ? 0xFF12141A : 0xFFF6F7FB;
+        card = dark ? 0xFF1C1F28 : 0xFFFFFFFF;
+        text = dark ? 0xFFECEEF4 : 0xFF1B1F2A;
+        muted = dark ? 0xFF9AA1B2 : 0xFF6B7280;
+        accent = dark ? 0xFFA58BFF : 0xFF5B3CC4;
+        getWindow().setStatusBarColor(bg);
+        getWindow().setNavigationBarColor(bg);
+
+        if (Store.url(this).isEmpty()) showSetup(false);
+        else showMain();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (importantBody != null) render();
+    }
+
+    // ---------- main screen ----------
+
+    private void showMain() {
+        Scheduler.scheduleNext(this);
+        askNotificationPermission();
+
+        LinearLayout root = column();
+        root.setBackgroundColor(bg);
+        root.setPadding(dp(20), dp(40), dp(20), dp(16));
+        root.addView(tv("📚 شو عندي", 22, text, true));
+
+        // Important items sit in the middle of the screen.
+        FrameLayout mid = new FrameLayout(this);
+        root.addView(mid, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+
+        LinearLayout box = column();
+        box.setBackground(rounded(card, dp(20)));
+        box.setPadding(dp(20), dp(24), dp(20), dp(24));
+        importantCard = box;
+        importantLabel = tv("", 15, accent, true);
+        importantBody = tv("", 20, text, false);
+        importantBody.setPadding(0, dp(10), 0, 0);
+        box.addView(importantLabel);
+        box.addView(importantBody);
+        mid.addView(box, new FrameLayout.LayoutParams(MATCH, WRAP, Gravity.CENTER));
+
+        LinearLayout filters = new LinearLayout(this);
+        filters.setOrientation(LinearLayout.HORIZONTAL);
+        filters.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+        for (int i = 0; i < FILTER_LABELS.length; i++) {
+            final int m = i;
+            filterBtns[i] = button(FILTER_LABELS[i], v -> { mode = m; render(); });
+            filters.addView(filterBtns[i], new LinearLayout.LayoutParams(0, WRAP, 1f));
+        }
+        root.addView(filters);
+
+        ScrollView sv = new ScrollView(this);
+        listView = tv("", 15, muted, false);
+        listView.setPadding(dp(4), dp(8), dp(4), dp(8));
+        sv.addView(listView);
+        root.addView(sv, new LinearLayout.LayoutParams(MATCH, 0, 0.8f));
+
+        status = tv("", 12, muted, false);
+        status.setPadding(0, dp(6), 0, dp(6));
+        root.addView(status);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+        row.addView(button("تحديث", v -> refreshAsync()), new LinearLayout.LayoutParams(0, WRAP, 1f));
+        row.addView(button("جرّب الإشعار", v -> testNotification()), new LinearLayout.LayoutParams(0, WRAP, 1f));
+        row.addView(button("الإعدادات", v -> showSetup(true)), new LinearLayout.LayoutParams(0, WRAP, 1f));
+        root.addView(row);
+
+        setContentView(root);
+        render();
+        refreshAsync();
+    }
+
+    private void render() {
+        if (importantBody == null) return;
+        List<Event> evs = Names.apply(Store.names(this), Store.loadEvents(this));
+        ZoneId z = Store.zone();
+        LocalDate today = LocalDate.now();
+
+        boolean pastMode = mode != 0;
+        for (int i = 0; i < filterBtns.length; i++) filterBtns[i].setAlpha(i == mode ? 1f : 0.55f);
+        importantCard.setVisibility(pastMode ? View.GONE : View.VISIBLE);
+
+        List<Event> imp = Brief.important(evs, today, z);
+        if (imp.isEmpty()) {
+            importantLabel.setText("✅ ما في شي مهم");
+            importantBody.setText("ما في كويزات أو تسليمات قريبة. استرح 🎉");
+        } else {
+            importantLabel.setText("⚠️ الأهم");
+            StringBuilder sbImp = new StringBuilder();
+            for (Event e : imp) {
+                if (sbImp.length() > 0) sbImp.append("\n\n");
+                sbImp.append(Brief.describe(e, today, z));
+            }
+            importantBody.setText(sbImp.toString());
+        }
+
+        StringBuilder sbList = new StringBuilder();
+        if (!pastMode) {
+            appendDay(sbList, "اليوم", Brief.onDay(evs, today, z), z);
+            appendDay(sbList, "بكرة", Brief.onDay(evs, today.plusDays(1), z), z);
+        } else {
+            int days = mode == 1 ? 7 : 30;
+            for (int back = 1; back <= days; back++) {
+                LocalDate d = today.minusDays(back);
+                List<Event> dayEvs = Brief.onDay(evs, d, z);
+                if (dayEvs.isEmpty()) continue;
+                String label = (back == 1 ? "أمس" : "قبل " + back + " أيام")
+                        + " (" + String.format(Locale.ROOT, "%02d/%02d", d.getDayOfMonth(), d.getMonthValue()) + ")";
+                appendDay(sbList, label, dayEvs, z);
+            }
+            if (sbList.length() == 0) sbList.append("ما في أحداث بهالفترة");
+        }
+        listView.setText(sbList.toString().trim());
+
+        long t = Store.fetchedAt(this);
+        status.setText(t == 0 ? "لسه ما انجلب التقويم"
+                : "آخر تحديث: " + DateTimeFormatter.ofPattern("dd/MM HH:mm").format(Instant.ofEpochMilli(t).atZone(z)));
+    }
+
+    private void appendDay(StringBuilder sb, String label, List<Event> evs, ZoneId z) {
+        sb.append(label).append('\n');
+        if (evs.isEmpty()) sb.append("ما في شي\n");
+        else for (Event e : evs) sb.append(Brief.line(e, z)).append('\n');
+        sb.append('\n');
+    }
+
+    private void refreshAsync() {
+        if (status == null) return;
+        status.setText("عم يتحدّث...");
+        final Context app = getApplicationContext();
+        new Thread(() -> {
+            final boolean ok = Refresher.refresh(app);
+            ui.post(() -> {
+                if (importantBody == null) return;
+                render();
+                if (!ok) status.setText("تعذّر التحديث (" + Store.lastError(app) + ")");
+            });
+        }).start();
+    }
+
+    private void testNotification() {
+        askNotificationPermission();
+        final Context app = getApplicationContext();
+        new Thread(() -> Refresher.refreshAndNotify(app)).start();
+        Toast.makeText(this, "تم، شوف الإشعارات", Toast.LENGTH_SHORT).show();
+    }
+
+    // ---------- setup / settings screen ----------
+
+    private void showSetup(final boolean editing) {
+        importantLabel = null;
+        importantBody = null;
+        listView = null;
+        status = null;
+
+        LinearLayout root = column();
+        root.setPadding(dp(20), dp(40), dp(20), dp(24));
+        ScrollView sv = new ScrollView(this);
+        sv.setBackgroundColor(bg);
+        sv.setFillViewport(true);
+        sv.addView(root);
+
+        root.addView(tv("📚 شو عندي", 22, text, true));
+
+        TextView help = tv("الصق رابط تقويم Moodle: من الموقع افتح التقويم ← استيراد أو تصدير التقويمات ← تصدير التقويم ← إجلب عنوان رابط التقويم. الرابط بيتخزّن على جوالك بس.", 15, muted, false);
+        help.setPadding(0, dp(12), 0, dp(12));
+        root.addView(help);
+
+        final EditText urlBox = new EditText(this);
+        urlBox.setHint(editing ? "اترك فارغاً للإبقاء على الرابط الحالي" : "https://...");
+        urlBox.setSingleLine(false);
+        urlBox.setMinLines(3);
+        urlBox.setGravity(Gravity.START | Gravity.TOP);
+        urlBox.setTextDirection(View.TEXT_DIRECTION_LTR);
+        urlBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        root.addView(urlBox, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        TextView hourLabel = tv("ساعة الإشعار الصباحي (0 إلى 23)", 15, muted, false);
+        hourLabel.setPadding(0, dp(16), 0, 0);
+        root.addView(hourLabel);
+
+        final EditText hourBox = new EditText(this);
+        hourBox.setInputType(InputType.TYPE_CLASS_NUMBER);
+        hourBox.setText(String.valueOf(Store.hour(this)));
+        root.addView(hourBox, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        TextView namesLabel = tv("أسماء المساقات (اختياري): سطر لكل مساق بهالشكل: الرمز = الاسم. مثال: BSAI 1234 = الذكاء الاصطناعي", 15, muted, false);
+        namesLabel.setPadding(0, dp(16), 0, 0);
+        root.addView(namesLabel);
+
+        final EditText namesBox = new EditText(this);
+        namesBox.setHint("BSAI 1234 = الذكاء الاصطناعي");
+        namesBox.setSingleLine(false);
+        namesBox.setMinLines(4);
+        namesBox.setGravity(Gravity.START | Gravity.TOP);
+        namesBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        namesBox.setText(Store.names(this));
+        root.addView(namesBox, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        root.addView(button("حفظ", v -> {
+            String u = urlBox.getText().toString().trim().replaceAll("\\s+", "");
+            if (u.startsWith("webcal://")) u = "https://" + u.substring(9);
+            if (u.isEmpty() && editing) u = Store.url(this);
+            if (!u.startsWith("https://")) {
+                Toast.makeText(this, "الرابط لازم يبدأ بـ https://", Toast.LENGTH_LONG).show();
+                return;
+            }
+            int h;
+            try {
+                h = Integer.parseInt(hourBox.getText().toString().trim());
+            } catch (NumberFormatException e) {
+                h = 7;
+            }
+            if (h < 0 || h > 23) h = 7;
+            Store.setUrl(this, u);
+            Store.setHour(this, h);
+            Store.setNames(this, namesBox.getText().toString());
+            showMain();
+        }));
+
+        if (editing) root.addView(button("رجوع", v -> showMain()));
+
+        TextView hint = tv("إذا الإشعار ما وصلك الصبح: افتح إعدادات التطبيق، وخلّي البطارية «بدون قيود» وفعّل «التشغيل التلقائي» إن وجد.", 13, muted, false);
+        hint.setPadding(0, dp(20), 0, dp(8));
+        root.addView(hint);
+        root.addView(button("إعدادات التطبيق (بطارية / تشغيل تلقائي)", v -> {
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()));
+            startActivity(i);
+        }));
+
+        setContentView(sv);
+    }
+
+    // ---------- helpers ----------
+
+    private void askNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+        }
+    }
+
+    private int dp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
+    private LinearLayout column() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        l.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+        return l;
+    }
+
+    private TextView tv(String s, int sp, int color, boolean bold) {
+        TextView t = new TextView(this);
+        t.setText(s);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        if (bold) t.setTypeface(null, Typeface.BOLD);
+        t.setLineSpacing(0f, 1.15f);
+        return t;
+    }
+
+    private Button button(String label, View.OnClickListener l) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setOnClickListener(l);
+        return b;
+    }
+
+    private GradientDrawable rounded(int color, int radiusPx) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(radiusPx);
+        return g;
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Names.java ===
+package app.studybrief;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Replaces course codes with real course names.
+ * The spec is plain text, one course per line:  BSAI 1234 = الذكاء الاصطناعي
+ * Matching ignores case and the spaces inside the code ("BSAI1234" matches "BSAI 1234").
+ */
+final class Names {
+    private Names() {}
+
+    private static final class Rule {
+        final String code;
+        final Pattern pattern;
+        final String replacement;
+
+        Rule(String code, Pattern pattern, String replacement) {
+            this.code = code;
+            this.pattern = pattern;
+            this.replacement = replacement;
+        }
+    }
+
+    private static List<Rule> parse(String spec) {
+        List<Rule> rules = new ArrayList<>();
+        if (spec == null) return rules;
+        for (String line : spec.split("\n")) {
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            String code = line.substring(0, eq).trim();
+            String name = line.substring(eq + 1).trim();
+            if (code.isEmpty() || name.isEmpty()) continue;
+
+            // Spaces never matter: "BSAI 1234", "BSAI1234" and "bsai  1234" are all the same code.
+            String compact = code.replaceAll("\\s+", "");
+            StringBuilder re = new StringBuilder("(?<![A-Za-z0-9])");
+            boolean first = true;
+            for (int i = 0; i < compact.length(); ) {
+                int cp = compact.codePointAt(i);
+                if (!first) re.append("\\s*");
+                first = false;
+                re.append(Pattern.quote(new String(Character.toChars(cp))));
+                i += Character.charCount(cp);
+            }
+            re.append("(?!\\d)"); // "BSAI 12" must not match inside "BSAI 1234"
+            rules.add(new Rule(compact,
+                    Pattern.compile(re.toString(), Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE),
+                    Matcher.quoteReplacement(name)));
+        }
+        // Longer codes first, so "BSAI 12345" is not eaten by "BSAI 1234".
+        Collections.sort(rules, new Comparator<Rule>() {
+            @Override public int compare(Rule a, Rule b) { return b.code.length() - a.code.length(); }
+        });
+        return rules;
+    }
+
+    private static String map(List<Rule> rules, String s) {
+        String out = s;
+        for (Rule r : rules) out = r.pattern.matcher(out).replaceAll(r.replacement);
+        return out;
+    }
+
+    /** Moodle appends internal ids such as ".t355.12026" after a code. They are never shown. */
+    private static final Pattern INTERNAL = Pattern.compile("\\.[A-Za-z]\\d+\\.\\d+");
+
+    static String stripInternal(String s) {
+        return INTERNAL.matcher(s).replaceAll("");
+    }
+
+    static List<Event> apply(String spec, List<Event> evs) {
+        List<Rule> rules = parse(spec);
+        List<Event> out = new ArrayList<>();
+        for (Event e : evs) {
+            String t = stripInternal(e.title);
+            String c = stripInternal(e.course);
+            if (!rules.isEmpty()) {
+                t = map(rules, t);
+                c = map(rules, c);
+            }
+            out.add(new Event(e.start, e.allDay, t, c));
+        }
+        return out;
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Net.java ===
+package app.studybrief;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+
+final class Net {
+    private Net() {}
+
+    /** Error messages here must never contain the URL (it holds a private token). */
+    static String get(String url) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            c.setConnectTimeout(7000);
+            c.setReadTimeout(8000);
+            c.setRequestProperty("User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36");
+            c.setRequestProperty("Accept", "text/calendar,text/plain,*/*;q=0.8");
+            int code = c.getResponseCode();
+            if (code != 200) throw new IOException("HTTP " + code);
+            try (InputStream in = c.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                return out.toString("UTF-8");
+            }
+        } finally {
+            c.disconnect();
+        }
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Notifier.java ===
+package app.studybrief;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Context;
+import android.content.Intent;
+
+final class Notifier {
+    private Notifier() {}
+
+    private static final String CHANNEL = "daily";
+
+    static void show(Context c, String title, String body) {
+        NotificationManager nm = c.getSystemService(NotificationManager.class);
+        if (nm == null) return;
+        nm.createNotificationChannel(new NotificationChannel(CHANNEL, "الملخص اليومي", NotificationManager.IMPORTANCE_HIGH));
+
+        Intent open = new Intent(c, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent pi = PendingIntent.getActivity(c, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+        int nl = body.indexOf('\n');
+        String firstLine = nl < 0 ? body : body.substring(0, nl);
+
+        Notification n = new Notification.Builder(c, CHANNEL)
+                .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                .setContentTitle(title)
+                .setContentText(firstLine)
+                .setStyle(new Notification.BigTextStyle().bigText(body))
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build();
+        nm.notify(1, n);
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Refresher.java ===
+package app.studybrief;
+
+import android.content.Context;
+
+import java.time.LocalDate;
+import java.util.List;
+
+/** Blocking work: call from a background thread only. */
+final class Refresher {
+    private Refresher() {}
+
+    static boolean refresh(Context c) {
+        String url = Store.url(c);
+        if (url.isEmpty()) return false;
+        try {
+            String body = Net.get(url);
+            List<Event> evs = Ics.parse(body, Store.zone());
+            Store.saveEvents(c, evs, System.currentTimeMillis());
+            return true;
+        } catch (Exception e) {
+            String msg = e.getMessage();
+            Store.setError(c, e.getClass().getSimpleName() + (msg == null ? "" : ": " + msg));
+            return false;
+        }
+    }
+
+    /** Fetch, then post the morning notification (uses cached data if the fetch failed). */
+    static void refreshAndNotify(Context c) {
+        boolean ok = refresh(c);
+        List<Event> evs = Names.apply(Store.names(c), Store.loadEvents(c));
+        if (!ok && evs.isEmpty()) {
+            Notifier.show(c, "📚 شو عندك اليوم", "تعذّر تحديث التقويم. افتح التطبيق وتأكد من الرابط والإنترنت.");
+            return;
+        }
+        String body = Brief.notificationBody(evs, LocalDate.now(), Store.zone());
+        if (!ok) body += "\n\n(تعذّر التحديث، هاي آخر بيانات محفوظة)";
+        Notifier.show(c, "📚 شو عندك اليوم", body);
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Scheduler.java ===
+package app.studybrief;
+
+import android.app.AlarmManager;
+import android.app.PendingIntent;
+import android.content.Context;
+import android.content.Intent;
+
+import java.time.ZonedDateTime;
+
+final class Scheduler {
+    private Scheduler() {}
+
+    /** Arms one alarm for the next occurrence of the chosen hour. The receiver re-arms it each day. */
+    static void scheduleNext(Context c) {
+        AlarmManager am = c.getSystemService(AlarmManager.class);
+        if (am == null) return;
+        ZonedDateTime now = ZonedDateTime.now();
+        ZonedDateTime next = now.toLocalDate().atTime(Store.hour(c), 0).atZone(now.getZone());
+        if (!next.isAfter(now.plusMinutes(1))) next = next.plusDays(1);
+
+        PendingIntent pi = PendingIntent.getBroadcast(c, 1, new Intent(c, AlarmReceiver.class),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        // Inexact (needs no special permission); may arrive a few minutes late when the phone is idle.
+        am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next.toInstant().toEpochMilli(), pi);
+    }
+}
+=== FILE: app/src/main/java/app/studybrief/Store.java ===
+package app.studybrief;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.List;
+
+/** Private on-device storage. The calendar link never leaves the phone except to fetch the calendar. */
+final class Store {
+    private Store() {}
+
+    private static SharedPreferences p(Context c) {
+        return c.getSharedPreferences("brief", Context.MODE_PRIVATE);
+    }
+
+    static String url(Context c) { return p(c).getString("url", ""); }
+    static void setUrl(Context c, String u) { p(c).edit().putString("url", u).apply(); }
+
+    static int hour(Context c) { return p(c).getInt("hour", 7); }
+    static void setHour(Context c, int h) { p(c).edit().putInt("hour", h).apply(); }
+
+    /** Course list the app starts with (the user can still change it in Settings). */
+    static final String DEFAULT_NAMES = String.join("\n",
+            "UNI 2308 = دراسات فلسطينية وعربية",
+            "UNI 2109 = مهارات الاتصال والقيادة",
+            "BSAI 2121 = هياكل البيانات وتحليل الخوارزميات - عملي",
+            "BSAI 2125 = مقدمة في الذكاء الاصطناعي - عملي",
+            "BSAI 2123 = قواعد البيانات - عملي",
+            "BSAI 2223 = قواعد البيانات",
+            "BENG 2213 = مقدمة في الذكاء الاصطناعي",
+            "BSAI 2221 = هياكل البيانات وتحليل الخوارزميات",
+            "BSAI 2117 = أخلاقيات الهندسة لأنظمة البرمجيات والذكاء الاصطناعي",
+            "BSAI 2217F = الكترونيات",
+            "BSAI 2227 = مقدمة في أمن المعلومات والأمن السيبراني");
+
+    static String names(Context c) { return p(c).getString("names", DEFAULT_NAMES); }
+    static void setNames(Context c, String s) { p(c).edit().putString("names", s).apply(); }
+
+    static long fetchedAt(Context c) { return p(c).getLong("fetchedAt", 0L); }
+
+    static String lastError(Context c) { return p(c).getString("error", ""); }
+    static void setError(Context c, String e) { p(c).edit().putString("error", e == null ? "" : e).apply(); }
+
+    static void saveEvents(Context c, List<Event> evs, long fetchedAt) {
+        StringBuilder sb = new StringBuilder();
+        for (Event e : evs) {
+            sb.append(e.start).append('\t').append(e.allDay ? 1 : 0).append('\t')
+              .append(clean(e.title)).append('\t').append(clean(e.course)).append('\n');
+        }
+        p(c).edit().putString("events", sb.toString()).putLong("fetchedAt", fetchedAt).putString("error", "").apply();
+    }
+
+    static List<Event> loadEvents(Context c) {
+        List<Event> out = new ArrayList<>();
+        String raw = p(c).getString("events", "");
+        if (raw.isEmpty()) return out;
+        for (String line : raw.split("\n")) {
+            String[] f = line.split("\t", -1);
+            if (f.length < 4) continue;
+            try {
+                out.add(new Event(Long.parseLong(f[0]), f[1].equals("1"), f[2], f[3]));
+            } catch (NumberFormatException ignored) {
+                // skip a damaged line
+            }
+        }
+        return out;
+    }
+
+    static ZoneId zone() { return ZoneId.systemDefault(); }
+
+    private static String clean(String s) { return s.replace('\t', ' ').replace('\n', ' ').replace('\r', ' '); }
+}
+=== FILE: app/src/main/res/drawable/ic_launcher.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#5B3CC4"
+        android:pathData="M24,0h60a24,24 0 0 1 24,24v60a24,24 0 0 1 -24,24h-60a24,24 0 0 1 -24,-24v-60a24,24 0 0 1 24,-24z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,36h48v8h-48z M30,52h48v8h-48z M30,68h32v8h-32z" />
+</vector>
+=== FILE: app/src/main/res/values/strings.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">شو عندي</string>
+</resources>
+=== FILE: app/src/main/res/values/themes.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
+=== FILE: app/src/main/res/values-night/themes.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:Theme.Material.NoActionBar" />
+</resources>
+=== FILE: app/studybrief.jks.b64 ===
+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
+=== FILE: build.gradle ===
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}
+=== FILE: gradle.properties ===
+org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+android.useAndroidX=false
+android.nonTransitiveRClass=true
+=== FILE: settings.gradle ===
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "StudyBrief"
+include ':app'
